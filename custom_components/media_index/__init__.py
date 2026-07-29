@@ -70,6 +70,7 @@ from .const import (
     SERVICE_INDEX_BURST_GROUPS,
     SERVICE_FIND_DUPLICATE_FILES,
     SERVICE_INSTALL_LIBMEDIAINFO,
+    SERVICE_CHECK_VIDEO_EXTRACTION,
     SERVICE_CHECK_FILE_EXISTS,
     SERVICE_UPDATE_SYNC_STATE,
     SERVICE_GET_SYNC_STATE,
@@ -88,6 +89,7 @@ from .scanner import MediaScanner
 from .watcher import MediaWatcher
 from .exif_parser import ExifParser
 from .video_parser import VideoMetadataParser
+from . import video_parser
 from .geocoding import GeocodeService
 from .cast_manager import CastSessionManager, HaMediaPlayerTransport, RokuEcpTransport, _get_roku_host, run_cast_slideshow, run_mirror_cast
 
@@ -635,7 +637,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     
     # Store availability status for services to check
     hass.data[DOMAIN][entry.entry_id]["pymediainfo_available"] = pymediainfo_available
-    
+
+    # Keep video_parser's own module-level PYMEDIAINFO_AVAILABLE flag in sync.
+    # VideoMetadataParser.extract_metadata() gates all pymediainfo extraction on that
+    # flag, which is normally only computed once at first import - without this call
+    # it would stay stale (e.g. False) across config entry reloads even though the
+    # check above just verified the library loads fine.
+    # Runs importlib.reload(), tempfile I/O, and MediaInfo.parse() - all blocking -
+    # so it must run in an executor to avoid blocking the event loop during setup.
+    await hass.async_add_executor_job(video_parser.refresh_pymediainfo_availability)
+
     # Auto-install if missing and auto_install is enabled - DO IT NOW before continuing setup
     if not pymediainfo_available:
         config = {**entry.data, **entry.options}
@@ -654,20 +665,27 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 _LOGGER.info("✅ Auto-install successful: %s", result["message"])
                 # Re-test library availability after installation
                 try:
-                    # Clear Python's import cache and reload the module to pick up the newly installed library.
-                    # importlib.reload does blocking filesystem I/O (listdir, read_text), so run it in an
-                    # executor thread to avoid blocking the event loop.
+                    # Clear Python's import cache and reload the pymediainfo module to pick up
+                    # the newly installed library. importlib.reload does blocking filesystem I/O
+                    # (listdir, read_text), so run it in an executor thread to avoid blocking the
+                    # event loop.
                     import sys
                     import importlib
 
                     def _reload_and_verify():
                         if 'pymediainfo' in sys.modules:
                             importlib.reload(sys.modules['pymediainfo'])
-                        from pymediainfo import MediaInfo  # noqa: F401
+                        # Re-test MediaInfo.can_parse() and refresh video_parser's own
+                        # PYMEDIAINFO_AVAILABLE flag - this is the flag extract_metadata()
+                        # actually checks, so reloading pymediainfo alone is not enough.
+                        return video_parser.refresh_pymediainfo_availability()
 
-                    await hass.async_add_executor_job(_reload_and_verify)
-                    hass.data[DOMAIN][entry.entry_id]["pymediainfo_available"] = True
-                    _LOGGER.info("✅ libmediainfo verified working after installation (import successful)")
+                    verified = await hass.async_add_executor_job(_reload_and_verify)
+                    hass.data[DOMAIN][entry.entry_id]["pymediainfo_available"] = verified
+                    if verified:
+                        _LOGGER.info("✅ libmediainfo verified working after installation")
+                    else:
+                        raise RuntimeError("MediaInfo.can_parse() still failing after install")
                 except Exception as e:
                     _LOGGER.error(
                         "❌ libmediainfo verification failed after installation: %s\n"
@@ -2308,6 +2326,94 @@ def _register_services(hass: HomeAssistant):
         entry_id = _get_entry_id_from_call(hass, call)
         return await _install_libmediainfo_internal(hass, entry_id)
 
+    async def handle_check_video_extraction(call):
+        """Diagnose whether libmediainfo is installed and video metadata extraction works.
+
+        Runs three independent checks and returns a clear per-step result so the user
+        can pinpoint exactly which layer is broken:
+
+        1. pymediainfo_importable   - Python package present and importable
+        2. c_library_loads          - libmediainfo.so C library loads (MediaInfo.parse on a temp file)
+        3. module_flag_active       - video_parser.PYMEDIAINFO_AVAILABLE is True (extraction will run)
+
+        The top-level ``is_working`` field is True only when all three pass.
+
+        Also calls video_parser.refresh_pymediainfo_availability() to reset the module-level
+        flag so the result reflects the current system state (not a stale cached value from
+        startup), and updates hass.data so the sensor attribute reflects the new state too.
+        """
+        import tempfile
+        import os as _os_diag
+
+        result = {
+            "is_working": False,
+            "pymediainfo_importable": False,
+            "c_library_loads": False,
+            "module_flag_active": False,
+            "details": {},
+        }
+
+        # Step 1: can we import the Python package?
+        # importlib.reload() and the import both do blocking filesystem I/O, so run them
+        # in an executor to avoid blocking the event loop. Reload failures (e.g. a stubbed
+        # module missing __spec__ in some environments) are tolerated and fall through to
+        # the import - only a genuine ImportError on the import itself should fail this step.
+        def _reload_and_import():
+            import importlib
+            import sys as _sys_diag
+            if 'pymediainfo' in _sys_diag.modules:
+                try:
+                    importlib.reload(_sys_diag.modules['pymediainfo'])
+                except Exception:
+                    pass
+            from pymediainfo import MediaInfo as _MI_diag
+            return _MI_diag
+
+        try:
+            _MI_diag = await hass.async_add_executor_job(_reload_and_import)
+            result["pymediainfo_importable"] = True
+            result["details"]["pymediainfo"] = "Python package is installed and importable"
+        except ImportError as e:
+            result["details"]["pymediainfo"] = f"ImportError: {e}"
+            return result
+
+        # Step 2: does the C library actually load?
+        try:
+            test_fd, test_path = tempfile.mkstemp(suffix='.mp4')
+            _os_diag.close(test_fd)
+            try:
+                def _parse_temp():
+                    return _MI_diag.parse(test_path)
+                media_info = await hass.async_add_executor_job(_parse_temp)
+                track_count = len(media_info.tracks) if media_info else 0
+                result["c_library_loads"] = True
+                result["details"]["c_library"] = f"libmediainfo loaded and parsed temp file ({track_count} tracks)"
+            finally:
+                _os_diag.unlink(test_path)
+        except Exception as e:
+            result["details"]["c_library"] = f"Failed to parse temp file: {e}"
+            return result
+
+        # Step 3: call refresh_pymediainfo_availability() to sync the module-level flag, then report it.
+        refreshed = await hass.async_add_executor_job(video_parser.refresh_pymediainfo_availability)
+        result["module_flag_active"] = refreshed
+        # Always update hass.data so the sensor attribute reflects the current state -
+        # not just on success. Otherwise a previously-True flag would keep reporting
+        # "available" even after this check just proved it False.
+        entry_id = _get_entry_id_from_call(hass, call)
+        if entry_id and DOMAIN in hass.data and entry_id in hass.data[DOMAIN]:
+            hass.data[DOMAIN][entry_id]["pymediainfo_available"] = refreshed
+        if refreshed:
+            result["details"]["module_flag"] = "video_parser.PYMEDIAINFO_AVAILABLE = True (extraction will run)"
+        else:
+            result["details"]["module_flag"] = (
+                "video_parser.PYMEDIAINFO_AVAILABLE = False even though C library parsed OK - "
+                "refresh_pymediainfo_availability() returned False unexpectedly"
+            )
+
+        result["is_working"] = result["pymediainfo_importable"] and result["c_library_loads"] and result["module_flag_active"]
+        return result
+
     async def handle_get_stream_url(call):
         """Return a short HMAC-signed stream URL for a media file (PoC for Roku ECP cast).
 
@@ -2992,6 +3098,13 @@ def _register_services(hass: HomeAssistant):
         DOMAIN,
         SERVICE_INSTALL_LIBMEDIAINFO,
         handle_install_libmediainfo,
+        supports_response=SupportsResponse.ONLY,
+    )
+
+    hass.services.async_register(
+        DOMAIN,
+        SERVICE_CHECK_VIDEO_EXTRACTION,
+        handle_check_video_extraction,
         supports_response=SupportsResponse.ONLY,
     )
 
